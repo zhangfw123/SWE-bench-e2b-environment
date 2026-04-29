@@ -163,6 +163,11 @@ cython_debug/
 .api_key
 .keys
 .vscode/
+runs/
+*.traj.json
+traj.json
+exit_statuses*.yaml
+preds.json
 *.jsonl
 *.jsonl.*
 *.patch
