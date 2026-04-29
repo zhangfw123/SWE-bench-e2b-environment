@@ -51,6 +51,7 @@ from swebench.harness.modal_eval import (
     run_instances_modal,
     validate_modal_credentials,
 )
+from swebench.harness.e2b_eval import run_instances_e2b, validate_e2b_credentials
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
 from swebench.harness.utils import (
     EvaluationError,
@@ -486,9 +487,20 @@ def main(
     namespace: str | None,
     rewrite_reports: bool,
     modal: bool,
+    e2b: bool,
     instance_image_tag: str = "latest",
     env_image_tag: str = "latest",
     report_dir: str = ".",
+    e2b_template: str | None = None,
+    e2b_api_key: str | None = None,
+    e2b_sandbox_timeout: int = 3600,
+    e2b_request_timeout: float | None = None,
+    e2b_cpu_count: int = 2,
+    e2b_memory_mb: int = 1024,
+    e2b_user: str | None = DOCKER_USER,
+    swebench_pro_scripts_dir: str | None = None,
+    multi_swe_fix_patch_path: str = "/home/fix.patch",
+    multi_swe_fix_patch_run_cmd: str = "bash /home/fix-run.sh",
 ):
     """
     Run evaluation harness for the given dataset and predictions.
@@ -509,6 +521,8 @@ def main(
 
     if force_rebuild and namespace is not None:
         raise ValueError("Cannot force rebuild and use a namespace at the same time.")
+    if modal and e2b:
+        raise ValueError("Cannot use Modal and E2B evaluation at the same time.")
 
     # load predictions as map of instance_id to prediction
     predictions = get_predictions_from_file(predictions_path, dataset_name, split)
@@ -528,6 +542,43 @@ def main(
             validate_modal_credentials()
             run_instances_modal(predictions, dataset, full_dataset, run_id, timeout)
         return
+
+    if e2b:
+        if not dataset:
+            print("No instances to run.")
+        else:
+            validate_e2b_credentials(e2b_api_key)
+            run_instances_e2b(
+                predictions,
+                dataset,
+                full_dataset,
+                run_id=run_id,
+                timeout=timeout,
+                max_workers=max_workers,
+                namespace=namespace,
+                instance_image_tag=instance_image_tag,
+                env_image_tag=env_image_tag,
+                rewrite_reports=rewrite_reports,
+                api_key=e2b_api_key,
+                template=e2b_template,
+                sandbox_timeout=e2b_sandbox_timeout,
+                request_timeout=e2b_request_timeout,
+                cpu_count=e2b_cpu_count,
+                memory_mb=e2b_memory_mb,
+                user=e2b_user,
+                swebench_pro_scripts_dir=swebench_pro_scripts_dir,
+                multi_swe_fix_patch_path=multi_swe_fix_patch_path,
+                multi_swe_fix_patch_run_cmd=multi_swe_fix_patch_run_cmd,
+            )
+        return make_run_report(
+            predictions,
+            full_dataset,
+            run_id,
+            client=None,
+            namespace=namespace,
+            instance_image_tag=instance_image_tag,
+            env_image_tag=env_image_tag,
+        )
 
     # run instances locally
     if platform.system() == "Linux":
@@ -672,6 +723,60 @@ if __name__ == "__main__":
 
     # Modal execution args
     parser.add_argument("--modal", type=str2bool, default=False, help="Run on Modal")
+
+    # E2B execution args
+    parser.add_argument("--e2b", type=str2bool, default=False, help="Run evaluation on E2B instead of local Docker")
+    parser.add_argument("--e2b_template", type=str, help="Use an existing E2B template for all instances")
+    parser.add_argument("--e2b_api_key", type=str, help="E2B API key. Defaults to E2B_API_KEY from the environment")
+    parser.add_argument(
+        "--e2b_sandbox_timeout",
+        type=int,
+        default=3600,
+        help="Timeout in seconds for keeping each E2B sandbox alive",
+    )
+    parser.add_argument(
+        "--e2b_request_timeout",
+        type=float,
+        help="Timeout in seconds for E2B control-plane requests",
+    )
+    parser.add_argument(
+        "--e2b_cpu_count",
+        type=int,
+        default=2,
+        help="Number of CPUs for E2B templates built from evaluation images",
+    )
+    parser.add_argument(
+        "--e2b_memory_mb",
+        type=int,
+        default=1024,
+        help="Memory in MB for E2B templates built from evaluation images",
+    )
+    parser.add_argument(
+        "--e2b_user",
+        type=optional_str,
+        default=DOCKER_USER,
+        help='User for E2B commands. (use "none" to let E2B choose)',
+    )
+    parser.add_argument(
+        "--swebench_pro_scripts_dir",
+        type=str,
+        help=(
+            "Directory containing SWE-bench Pro per-instance run_script.sh and parser.py files. "
+            "If omitted, scripts are cached from the official SWE-bench_Pro-os repository."
+        ),
+    )
+    parser.add_argument(
+        "--multi_swe_fix_patch_path",
+        type=str,
+        default="/home/fix.patch",
+        help="Path inside Multi-SWE-bench images where the model patch should be written",
+    )
+    parser.add_argument(
+        "--multi_swe_fix_patch_run_cmd",
+        type=str,
+        default="bash /home/fix-run.sh",
+        help="Command to run inside Multi-SWE-bench E2B sandboxes after writing the patch",
+    )
 
     args = parser.parse_args()
     main(**vars(args))

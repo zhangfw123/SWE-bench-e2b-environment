@@ -38,6 +38,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+e2b = [
+    "e2b>=2.3.0,<3",
+]
 datasets = [
     "protobuf",
     "sentencepiece",

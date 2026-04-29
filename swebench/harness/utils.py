@@ -22,6 +22,34 @@ from unidiff import PatchSet
 load_dotenv()
 
 
+DATASET_NAME_ALIASES = {
+    "swe-bench": "SWE-bench/SWE-bench",
+    "swebench": "SWE-bench/SWE-bench",
+    "swe_bench": "SWE-bench/SWE-bench",
+    "full": "SWE-bench/SWE-bench",
+    "swe-bench-lite": "SWE-bench/SWE-bench_Lite",
+    "swebench-lite": "SWE-bench/SWE-bench_Lite",
+    "swe_bench_lite": "SWE-bench/SWE-bench_Lite",
+    "swe-bench_lite": "SWE-bench/SWE-bench_Lite",
+    "lite": "SWE-bench/SWE-bench_Lite",
+    "swe-bench-pro": "ScaleAI/SWE-bench_Pro",
+    "swebench-pro": "ScaleAI/SWE-bench_Pro",
+    "swe_bench_pro": "ScaleAI/SWE-bench_Pro",
+    "pro": "ScaleAI/SWE-bench_Pro",
+    "multi-swe-bench": "ByteDance-Seed/Multi-SWE-bench",
+    "multi_swe_bench": "ByteDance-Seed/Multi-SWE-bench",
+}
+
+MULTI_LANGUAGE_DATASETS = {
+    "ByteDance-Seed/Multi-SWE-bench": ["c", "cpp", "go", "java", "js", "python", "rust", "ts"],
+}
+
+DEFAULT_DATASET_SPLITS = {
+    "ScaleAI/SWE-bench_Pro": "test",
+    "ByteDance-Seed/Multi-SWE-bench": "train",
+}
+
+
 class EvaluationError(Exception):
     def __init__(self, instance_id, message, logger):
         super().__init__(message)
@@ -45,7 +73,7 @@ def get_predictions_from_file(predictions_path: str, dataset_name: str, split: s
         return [
             {
                 KEY_INSTANCE_ID: datum[KEY_INSTANCE_ID],
-                KEY_PREDICTION: datum["patch"],
+                KEY_PREDICTION: datum.get("patch", datum.get("fix_patch", "")),
                 KEY_MODEL: "gold",
             }
             for datum in dataset
@@ -72,7 +100,14 @@ def get_predictions_from_file(predictions_path: str, dataset_name: str, split: s
         if not isinstance(pred, dict):
             raise ValueError(f"Each prediction must be a dictionary, got {type(pred)}")
         if KEY_INSTANCE_ID not in pred:
-            raise ValueError(f"Each prediction must contain '{KEY_INSTANCE_ID}'")
+            if all(key in pred for key in ("org", "repo", "number")):
+                pred[KEY_INSTANCE_ID] = f"{pred['org']}__{pred['repo']}-{pred['number']}"
+            else:
+                raise ValueError(f"Each prediction must contain '{KEY_INSTANCE_ID}'")
+        if KEY_MODEL not in pred:
+            pred[KEY_MODEL] = pred.get("model", pred.get("model_name", pred.get("prefix", "unknown")))
+        if KEY_PREDICTION not in pred:
+            pred[KEY_PREDICTION] = pred.get("patch", pred.get("fix_patch", pred.get("prediction", "")))
 
     return predictions
 
@@ -139,6 +174,10 @@ def load_swebench_dataset(
     # check that all instance IDs are in the dataset
     if instance_ids:
         instance_ids = set(instance_ids)
+    original_name = name
+    name = DATASET_NAME_ALIASES.get(name.lower(), name)
+    fallback_split = DEFAULT_DATASET_SPLITS.get(name)
+
     # Load from local .json/.jsonl file
     if name.endswith(".json"):
         dataset = json.loads(Path(name).read_text())
@@ -146,25 +185,31 @@ def load_swebench_dataset(
         dataset = [json.loads(line) for line in Path(name).read_text().splitlines()]
     elif name.endswith(".parquet"):
         dataset = cast(Dataset, load_dataset("parquet", data_files=name, split="train"))
+    elif _is_local_dataset_dict(Path(name)):
+        ds = load_from_disk(name)
+        resolved_split = _resolve_dataset_split(split, list(ds.keys()), fallback_split=fallback_split, dataset_name=name)
+        dataset = ds[resolved_split]
+    elif _is_local_multi_language_dataset(Path(name)):
+        dataset = _load_local_multi_language_dataset(Path(name))
+        name = "ByteDance-Seed/Multi-SWE-bench"
     else:
         # Load from Hugging Face Datasets
-        if name.lower() in {"swe-bench", "swebench", "swe_bench"}:
-            name = "SWE-bench/SWE-bench"
-        elif name.lower() in {
-            "swe-bench-lite",
-            "swebench-lite",
-            "swe_bench_lite",
-            "swe-bench_lite",
-            "lite",
-        }:
-            name = "SWE-bench/SWE-bench_Lite"
         parquet_path = Path(name) / f"{split}.parquet"
         if parquet_path.exists():
             dataset = cast(Dataset, load_dataset("parquet", data_files=str(parquet_path), split="train"))
         elif (Path(name) / split / "dataset_info.json").exists():
             dataset = cast(Dataset, load_from_disk(Path(name) / split))
+        elif name in MULTI_LANGUAGE_DATASETS:
+            dataset = _load_multi_language_dataset(name)
         else:
-            dataset = cast(Dataset, load_dataset(name, split=split))
+            try:
+                dataset = cast(Dataset, load_dataset(name, split=split))
+            except Exception as e:
+                if not fallback_split or split == fallback_split or not _is_missing_split_error(e):
+                    raise
+                print(f"{original_name} does not provide split {split}; loading {fallback_split} instead.")
+                dataset = cast(Dataset, load_dataset(name, split=fallback_split))
+    dataset = _mark_dataset_type_if_needed(list(dataset), name)
     dataset_ids = {instance[KEY_INSTANCE_ID] for instance in dataset}
     if instance_ids:
         if instance_ids - dataset_ids:
@@ -180,6 +225,92 @@ def load_swebench_dataset(
             if instance[KEY_INSTANCE_ID] in instance_ids
         ]
     return [cast(SWEbenchInstance, instance) for instance in dataset]
+
+
+def _is_local_dataset_dict(path: Path) -> bool:
+    return path.is_dir() and (path / "dataset_dict.json").exists()
+
+
+def _is_local_multi_language_dataset(path: Path) -> bool:
+    return path.is_dir() and any((path / language).is_dir() for languages in MULTI_LANGUAGE_DATASETS.values() for language in languages)
+
+
+def _resolve_dataset_split(
+    requested_split: str,
+    available_splits: list[str],
+    *,
+    fallback_split: str | None,
+    dataset_name: str,
+) -> str:
+    if requested_split in available_splits:
+        return requested_split
+    if fallback_split and fallback_split in available_splits:
+        print(f"{dataset_name} does not provide split {requested_split}; loading {fallback_split} instead.")
+        return fallback_split
+    if len(available_splits) == 1:
+        only_split = available_splits[0]
+        print(f"{dataset_name} only provides split {only_split}; loading {only_split} instead of {requested_split}.")
+        return only_split
+    return requested_split
+
+
+def _is_missing_split_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return "unknown split" in message or "bad split" in message or "corresponds to no data" in message
+
+
+def _load_multi_language_dataset(name: str) -> list[dict]:
+    languages = MULTI_LANGUAGE_DATASETS[name]
+    all_instances = []
+    for language in languages:
+        try:
+            dataset = load_dataset(name, data_files=f"{language}/*.jsonl", split="train")
+            all_instances.extend(list(dataset))
+        except Exception as load_error:
+            try:
+                from huggingface_hub import HfApi, hf_hub_download
+
+                api = HfApi()
+                jsonl_files = [
+                    file_name
+                    for file_name in api.list_repo_files(name, repo_type="dataset")
+                    if file_name.startswith(f"{language}/") and file_name.endswith(".jsonl")
+                ]
+                for jsonl_file in jsonl_files:
+                    local_path = hf_hub_download(name, jsonl_file, repo_type="dataset")
+                    with Path(local_path).open(encoding="utf-8") as f:
+                        all_instances.extend(json.loads(line) for line in f if line.strip())
+            except Exception as fallback_error:
+                print(
+                    f"Failed to load {language} subset from {name}: "
+                    f"{type(load_error).__name__}: {load_error}; "
+                    f"fallback failed with {type(fallback_error).__name__}: {fallback_error}"
+                )
+    return all_instances
+
+
+def _load_local_multi_language_dataset(path: Path) -> list[dict]:
+    all_instances = []
+    languages = next(iter(MULTI_LANGUAGE_DATASETS.values()))
+    for language in languages:
+        language_dir = path / language
+        if not language_dir.is_dir():
+            continue
+        for jsonl_file in sorted(language_dir.glob("*.jsonl")):
+            with jsonl_file.open(encoding="utf-8") as f:
+                all_instances.extend(json.loads(line) for line in f if line.strip())
+    return all_instances
+
+
+def _mark_dataset_type_if_needed(dataset: list[dict], name: str) -> list[dict]:
+    if name != "ByteDance-Seed/Multi-SWE-bench":
+        return dataset
+    marked = []
+    for instance in dataset:
+        instance_dict = dict(instance)
+        instance_dict["_dataset_type"] = "multi-swe-bench"
+        marked.append(instance_dict)
+    return marked
 
 
 ### MARK - Patch Correction
